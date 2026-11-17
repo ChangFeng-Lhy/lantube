@@ -9,4 +9,4 @@ npm ci
 npm run dev
 ```
 
-Vite proxies `/api` and `/file` to `127.0.0.1:8888`. Run `npm run build` to type-check and build the UI separately.
+Vite proxies `/api` and `/file` to `127.0.0.1:7777`. Run `npm run build` to type-check and build the UI separately.

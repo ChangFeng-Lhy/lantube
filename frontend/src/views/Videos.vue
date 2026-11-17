@@ -65,9 +65,11 @@ const volume = ref(1)
 const muted = ref(false)
 const speed = ref(1)
 const fullscreen = ref(false)
+const controlsVisible = ref(true)
 const playMode = ref<'automatic' | 'manual'>('automatic')
 const sleepMinutes = ref(0)
 let timer: number | undefined
+let controlsTimer: number | undefined
 
 const {src, revision: mediaRevision, loading: mediaLoading, failed: mediaLoadFailed, reload: reloadMedia} =
     useMediaSource(fileSource, unloadPlayback)
@@ -125,8 +127,15 @@ function selectChapter(chapter: Chapter) {
 }
 
 function openChapterPicker() {
+    clearControlsTimer()
+    controlsVisible.value = true
     chapterPicker.value?.showModal()
     pickerOpen.value = true
+}
+
+function closeChapterPicker() {
+    pickerOpen.value = !!chapterPicker.value?.open
+    showControls()
 }
 
 function validCut(startMs: number, chaptersToCheck: Chapter[]): boolean {
@@ -164,6 +173,8 @@ async function openChapterEditor(chapter: Chapter) {
         : document.activeElement instanceof HTMLElement ? document.activeElement : undefined
     chapterPicker.value?.close()
     pause()
+    clearControlsTimer()
+    controlsVisible.value = true
     editStart.value = chapter.startMs
     editTitle.value = chapter.title
     editTime.value = chapterTime(chapter.startMs)
@@ -179,6 +190,7 @@ async function openChapterEditor(chapter: Chapter) {
 
 function closeChapterEditor(restoreFocus = true) {
     editStart.value = undefined
+    if (fullscreen.value) scheduleControlsHide()
     if (restoreFocus) {
         const trigger = editTrigger?.isConnected ? editTrigger : stage.value
         trigger?.focus({preventScroll: true})
@@ -502,7 +514,12 @@ function ended() {
 }
 
 function updateFullscreen() {
-    fullscreen.value = document.fullscreenElement === stage.value
+    const next = document.fullscreenElement === stage.value
+    if (next === fullscreen.value) return
+    fullscreen.value = next
+    controlsVisible.value = true
+    if (next) scheduleControlsHide()
+    else clearControlsTimer()
 }
 
 async function toggleFullscreen() {
@@ -515,8 +532,60 @@ async function togglePip() {
     else await video.value?.requestPictureInPicture()
 }
 
+function clearControlsTimer() {
+    window.clearTimeout(controlsTimer)
+    controlsTimer = undefined
+}
+
+function scheduleControlsHide() {
+    clearControlsTimer()
+    if (!fullscreen.value || !playing.value || editStart.value !== undefined || pickerOpen.value) return
+    controlsTimer = window.setTimeout(() => {
+        controlsTimer = undefined
+        if (fullscreen.value && playing.value && editStart.value === undefined && !pickerOpen.value) {
+            controlsVisible.value = false
+        }
+    }, 3000)
+}
+
+function showControls() {
+    if (!fullscreen.value) return
+    controlsVisible.value = true
+    scheduleControlsHide()
+}
+
+function hideControls() {
+    clearControlsTimer()
+    controlsVisible.value = false
+}
+
+function holdControls() {
+    if (!fullscreen.value) return
+    clearControlsTimer()
+    controlsVisible.value = true
+}
+
+function releaseControls() {
+    if (fullscreen.value) scheduleControlsHide()
+}
+
+function onPlayerPointerMove(event: PointerEvent) {
+    if (event.pointerType !== 'touch') showControls()
+}
+
+function onPictureClick() {
+    if (fullscreen.value) {
+        if (editStart.value !== undefined || pickerOpen.value) return
+        if (controlsVisible.value) hideControls()
+        else showControls()
+        return
+    }
+    togglePlayback()
+}
+
 function playerKeys(event: KeyboardEvent) {
     if (event.target !== stage.value || !video.value || event.altKey || event.metaKey || event.ctrlKey) return
+    if (fullscreen.value) showControls()
     if (event.key === ' ') {
         event.preventDefault()
         togglePlayback()
@@ -574,10 +643,18 @@ watch([index, railTab], async () => {
     }
 }, {flush: 'post', immediate: true})
 
+watch(playing, (isPlaying) => {
+    if (!fullscreen.value) return
+    controlsVisible.value = true
+    if (isPlaying) scheduleControlsHide()
+    else clearControlsTimer()
+})
+
 onMounted(() => document.addEventListener('fullscreenchange', updateFullscreen))
 onBeforeUnmount(() => {
     unloadPlayback()
     window.clearTimeout(timer)
+    clearControlsTimer()
     document.removeEventListener('fullscreenchange', updateFullscreen)
 })
 
@@ -610,11 +687,13 @@ const supportsPip = document.pictureInPictureEnabled
 
             <div class="player-columns">
                 <div class="player-main">
-                    <div ref="stage" class="stage" :class="{'editing-chapter': editStart !== undefined}"
-                        tabindex="0" :aria-label="t('player')" role="region" @keydown="playerKeys">
+                    <div ref="stage" class="stage"
+                        :class="{'editing-chapter': editStart !== undefined, 'controls-hidden': !controlsVisible}"
+                        tabindex="0" :aria-label="t('player')" role="region" @keydown="playerKeys"
+                        @pointermove="onPlayerPointerMove">
                         <div class="picture" :class="{'audio-picture': audioLayout}">
                             <video ref="video" :src="compatible ? undefined : src || undefined" playsinline preload="metadata"
-                                @click="togglePlayback" @durationchange="mediaTime" @timeupdate="mediaTime"
+                                @click="onPictureClick" @durationchange="mediaTime" @timeupdate="mediaTime"
                                 @volumechange="mediaVolume" @play="playing = true" @pause="playing = false"
                                 @ended="ended" @loadeddata="onMediaData" @error="onMediaError"></video>
                             <div v-if="audioLayout" class="audio-art" aria-hidden="true"><Music2 :size="58" :stroke-width="1.3" /></div>
@@ -639,6 +718,8 @@ const supportsPip = document.pictureInPictureEnabled
                                 <Play :size="32" fill="currentColor" />
                             </button>
                         </div>
+                        <div class="player-chrome" @click="showControls" @pointerdown="holdControls" @pointerup="releaseControls"
+                            @pointerenter="holdControls" @pointerleave="releaseControls" @focusin="holdControls" @focusout="releaseControls">
                         <div class="controls">
                             <div class="timeline" :class="{'has-chapters': chapterSegments.length}">
                                 <div v-if="chapterSegments.length" class="chapter-track" aria-hidden="true">
@@ -699,9 +780,10 @@ const supportsPip = document.pictureInPictureEnabled
                             <button v-if="chapterIssue === 'chapterConflict' || chapterIssue === 'chapterLoadFailed'" class="chapter-tool"
                                 type="button" @click="retryChapters">{{ t('chapterReload') }}</button>
                         </div>
+                        </div>
 
                         <dialog ref="chapterPicker" class="chapter-dialog chapter-picker" aria-labelledby="chapter-picker-title"
-                            @click.self="chapterPicker?.close()" @close="pickerOpen = !!chapterPicker?.open">
+                            @click.self="chapterPicker?.close()" @close="closeChapterPicker">
                             <div class="chapter-dialog-body">
                                 <header class="chapter-dialog-heading">
                                     <h2 id="chapter-picker-title"><ListTree :size="19" />{{ t('chapters') }}</h2>
@@ -893,10 +975,36 @@ const supportsPip = document.pictureInPictureEnabled
 .time span { color: var(--muted); }
 .volume { width: clamp(35px, 5vw, 68px); }
 .speed { min-height: 31px; padding: 0 4px; border: 0; border-radius: 6px; background: transparent; color: var(--text); font-size: 12px; }
-.stage:fullscreen { border: 0; border-radius: 0; }
+.stage:fullscreen { position: relative; border: 0; border-radius: 0; background: #000; }
 .stage:fullscreen .picture { flex: 1; min-height: 0; aspect-ratio: auto; }
+.stage:fullscreen .player-chrome {
+    position: absolute;
+    inset-inline: 0;
+    bottom: 0;
+    z-index: 2;
+    padding-bottom: env(safe-area-inset-bottom);
+    background: linear-gradient(to top, #07090de6, #07090d99 55%, transparent);
+    transform: translateY(0);
+    transition: opacity 160ms ease, transform 220ms ease;
+}
+.stage:fullscreen.controls-hidden .player-chrome { opacity: 0; transform: translateY(100%); pointer-events: none; }
+.stage:fullscreen.controls-hidden, .stage:fullscreen.controls-hidden .picture video { cursor: none; }
+.stage:fullscreen .controls, .stage:fullscreen .chapter-toolbar { background: transparent; }
+.stage:fullscreen .chapter-toolbar { border-top-color: #ffffff1a; }
+.stage:fullscreen.editing-chapter .player-chrome {
+    position: static;
+    padding-bottom: 0;
+    background: transparent;
+    transform: none;
+    transition: none;
+}
+.stage:fullscreen.editing-chapter.controls-hidden .player-chrome { opacity: 1; pointer-events: auto; }
 .stage.editing-chapter { scroll-margin-top: 68px; }
 .editing-chapter:not(:fullscreen) .picture { max-height: 34dvh; }
+
+@media (prefers-reduced-motion: reduce) {
+    .stage:fullscreen .player-chrome { transition: none; }
+}
 
 .chapter-toolbar { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 4px 12px; border-top: 1px solid var(--border); background: #191c23; }
 .chapter-tool { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 0 9px; border: 0; border-radius: 6px; background: transparent; color: var(--text); font-size: 12px; font-weight: 600; white-space: nowrap; }

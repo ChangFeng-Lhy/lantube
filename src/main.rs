@@ -188,7 +188,7 @@ async fn load_config(working_dir: &Path, executable_dir: &Path) -> Result<Config
     Ok(Config {
         data,
         server: ServerConfig {
-            addr: (Ipv4Addr::LOCALHOST, 8888).into(),
+            addr: (Ipv4Addr::LOCALHOST, 7777).into(),
         },
         auth: None,
     })
@@ -458,7 +458,7 @@ mod tests {
         let config = load_config(working.path(), executable.path())
             .await
             .unwrap();
-        assert_eq!(config.server.addr, (Ipv4Addr::LOCALHOST, 8888).into());
+        assert_eq!(config.server.addr, (Ipv4Addr::LOCALHOST, 7777).into());
         assert!(config.data.is_empty());
 
         let share = executable.path().join("share");
