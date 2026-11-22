@@ -15,10 +15,62 @@ static SIGNING_KEY: LazyLock<Result<[u8; 32], getrandom::Error>> = LazyLock::new
     Ok(key)
 });
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Profile {
+    #[serde(rename = "original")]
+    Original,
+    #[serde(rename = "1080p")]
+    P1080,
+    #[serde(rename = "720p")]
+    #[default]
+    P720,
+    #[serde(rename = "480p")]
+    P480,
+}
+
+impl Profile {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "original" => Some(Self::Original),
+            "1080p" => Some(Self::P1080),
+            "720p" => Some(Self::P720),
+            "480p" => Some(Self::P480),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::P1080 => "1080p",
+            Self::P720 => "720p",
+            Self::P480 => "480p",
+        }
+    }
+
+    pub fn is_original(self) -> bool {
+        self == Self::Original
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PlaybackPlan {
     pub revision: u64,
+    #[serde(default)]
+    pub profile: Profile,
+    #[serde(default)]
+    pub session: Option<String>,
     pub timeline: PlaybackTimeline,
+}
+
+pub fn sanitize_session(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| value.to_owned())
 }
 
 impl PlaybackPlan {
@@ -74,6 +126,8 @@ mod tests {
         let path = "share/视频 &.mp4";
         let plan = PlaybackPlan {
             revision: 42,
+            profile: Profile::P720,
+            session: None,
             timeline: serde_json::from_str(
                 r#"{"picture":{"start":0,"end":10},"duration":10,"audio":1}"#,
             )

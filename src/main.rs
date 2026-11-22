@@ -39,6 +39,21 @@ struct Config {
     data: HashMap<String, PathBuf>,
     server: ServerConfig,
     auth: Option<auth::AuthConfig>,
+    cache: Option<CacheConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheConfig {
+    path: PathBuf,
+    #[serde(default = "default_cache_size_mb")]
+    max_size_mb: u64,
+    #[serde(default)]
+    cache_original_remux: bool,
+}
+
+fn default_cache_size_mb() -> u64 {
+    2048
 }
 
 #[derive(Clone, Default)]
@@ -47,6 +62,8 @@ struct AppState {
     tools: transcode::MediaTools,
     media: Arc<transcode::MediaAccess>,
     chapters: Arc<chapters::ChapterStore>,
+    cache: Option<Arc<transcode::TranscodeCache>>,
+    cache_original_remux: bool,
 }
 
 #[tokio::main]
@@ -77,11 +94,21 @@ async fn load_app(working_dir: &Path, executable_dir: &Path) -> Result<(Router, 
         .map(auth::AuthConfig::build)
         .transpose()?
         .unwrap_or_default();
+    let (cache, cache_original_remux) = match &config.cache {
+        Some(cache) => (
+            open_cache(cache, &config.data).await?,
+            cache.cache_original_remux,
+        ),
+        None => (None, false),
+    };
+    let cache_enabled = cache.is_some();
     let state = AppState {
         tools: transcode::MediaTools::from_path(&config.data),
         data: config.data,
         media: Arc::default(),
         chapters: Arc::new(chapters),
+        cache,
+        cache_original_remux: cache_original_remux && cache_enabled,
     };
     state.media.audio.start_reaper();
     Ok((router(state, auth), config.server.addr))
@@ -160,6 +187,11 @@ async fn load_config(working_dir: &Path, executable_dir: &Path) -> Result<Config
                 *root = directory.join(&*root);
             }
         }
+        if let Some(cache) = &mut config.cache
+            && cache.path.is_relative()
+        {
+            cache.path = directory.join(&cache.path);
+        }
         if config.auth.is_some() {
             let working_dir = fs::canonicalize(working_dir)
                 .await
@@ -191,7 +223,57 @@ async fn load_config(working_dir: &Path, executable_dir: &Path) -> Result<Config
             addr: (Ipv4Addr::LOCALHOST, 7777).into(),
         },
         auth: None,
+        cache: None,
     })
+}
+
+async fn open_cache(
+    config: &CacheConfig,
+    data: &HashMap<String, PathBuf>,
+) -> Result<Option<Arc<transcode::TranscodeCache>>> {
+    let cache_path = match fs::create_dir_all(&config.path).await {
+        Ok(()) => match fs::canonicalize(&config.path).await {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!(
+                    "Transcode cache disabled: could not resolve {}: {error}",
+                    config.path.display()
+                );
+                return Ok(None);
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "Transcode cache disabled: could not create {}: {error}",
+                config.path.display()
+            );
+            return Ok(None);
+        }
+    };
+    for (name, root) in data {
+        let Ok(root) = fs::canonicalize(root).await else {
+            continue;
+        };
+        ensure!(
+            !cache_path.starts_with(&root) && !root.starts_with(&cache_path),
+            "Transcode cache path overlaps media root {name:?}"
+        );
+    }
+    let max_bytes = config.max_size_mb.saturating_mul(1024 * 1024);
+    match transcode::TranscodeCache::open(cache_path, max_bytes).await {
+        Ok(cache) => {
+            eprintln!(
+                "Transcode cache enabled at {} ({} MB)",
+                cache.root().display(),
+                config.max_size_mb
+            );
+            Ok(Some(Arc::new(cache)))
+        }
+        Err(error) => {
+            eprintln!("Transcode cache disabled: {error:?}");
+            Ok(None)
+        }
+    }
 }
 
 async fn validate_private_paths(

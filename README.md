@@ -21,7 +21,10 @@ This is a LAN video server, which can be deployed on any device (with operating 
 # Features
 
 * Navigate shared folders with a directory tree, breadcrumbs and search within the current folder.
-* Browse video frames in the library and the play queue. Playback and thumbnails use the codecs supported by your browser.
+* Browse video frames in the library and the play queue.
+* Play H.264 videos without re-encoding, or transcode to compatible 1080p, 720p, or 480p.
+* Configure forward and back buffering in the player. Buffered media stays on the playback device, not in server memory.
+* Optionally cache compatible segments in a bounded LRU directory on disk.
 * Upload files, create folders and switch between English and Simplified Chinese.
 * Play the queue automatically or manually, with a sleep timer.
 
@@ -45,9 +48,22 @@ Start `lantube` (or `lantube.exe`) and open [http://127.0.0.1:7777](http://127.0
 
 To enable access from other devices on a trusted LAN or choose other media directories, use [config.example.toml](config.example.toml) as a template for `config.toml`. LanTube looks in the current working directory first, then beside the executable. Relative media paths are resolved from the configuration file's directory. The example listens on `0.0.0.0:7777`.
 
-Compatible playback and server-generated thumbnails require `ffmpeg` and `ffprobe` on the server's `PATH`, from FFmpeg 6.1 or later, with `libx264` enabled. Put the tools in an absolute `PATH` directory outside your media folders before starting LanTube. LanTube tries to generate H.264/AAC segments and thumbnails on demand when the browser cannot decode the video. You can also select **Compatible playback** below the player. The server reads the source files as-is.
+Compatible playback and server-generated thumbnails require `ffmpeg` and `ffprobe` on the server's `PATH`, from FFmpeg 5.1 or later. Put the tools in an absolute `PATH` directory outside your media folders before starting LanTube. Hardware H.264 encoders (`h264_v4l2m2m` or `h264_omx`) are detected and test-encoded at startup; LanTube falls back to `libx264` when neither works. The server reads the source files as-is.
+
+Use the quality menu below the player to choose the original stream or a compatible 1080p, 720p, or 480p stream. Original playback remuxes H.264 video without re-encoding and falls back to compatible 720p when a file cannot be remuxed. Open **Settings** to choose the default quality and the forward/back buffer lengths. Buffering is handled by hls.js on the playback device; the server only keeps the segments currently being generated or read. Changes to buffer settings apply the next time playback starts.
 
 Use **Show other files** in a folder to open media with an unrecognized or missing extension. Those entries are opened individually and stay out of automatic playback.
+
+Compatible segments can optionally be cached on disk. Add a `[cache]` section to `config.toml`:
+
+```toml
+[cache]
+path = "/mnt/usb/lantube-cache"
+max_size_mb = 2048
+cache_original_remux = false
+```
+
+The cache uses an LRU size limit, may be placed on a removable USB disk, and must not overlap a media directory. On startup LanTube removes incomplete temporary files and evicts the oldest segments to fit the limit. Original remux segments are streamed without writing to disk unless `cache_original_remux = true`. If the cache directory cannot be created or resolved, caching is disabled and playback continues normally.
 
 Choose **Split here** or press `C` while the player has focus to add a chapter at the current position. Open **Chapters** to jump to a chapter, or use the pencil button to rename it, adjust its start time, or merge it with the previous chapter. The server stores chapters in `data/chapters/` under its working directory. All devices share the same chapters, and the media files stay intact. With authentication enabled, editors can change chapters and viewers can open and navigate them.
 

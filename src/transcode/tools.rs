@@ -8,10 +8,12 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::Arc,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
+    sync::OnceCell,
 };
 
 const INPUT_FORMATS: &str =
@@ -26,11 +28,29 @@ fn input_options(protocols: &str) -> [&str; 4] {
     ]
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H264Encoder {
+    V4l2,
+    Omx,
+    X264,
+}
+
+impl H264Encoder {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::V4l2 => "h264_v4l2m2m",
+            Self::Omx => "h264_omx",
+            Self::X264 => "libx264",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MediaTools {
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
     search_path: OsString,
+    h264_encoder: Arc<OnceCell<H264Encoder>>,
 }
 
 impl MediaTools {
@@ -49,11 +69,68 @@ impl MediaTools {
             ffmpeg: find_tool("ffmpeg", &dirs, &roots),
             ffprobe: find_tool("ffprobe", &dirs, &roots),
             search_path: env::join_paths(&dirs).unwrap_or_default(),
+            h264_encoder: Arc::default(),
         }
     }
 
     pub fn encoder(&self) -> Result<&Path, AppError> {
         self.ffmpeg.as_deref().ok_or_else(tools_unavailable)
+    }
+
+    pub async fn h264_encoder(&self) -> H264Encoder {
+        *self
+            .h264_encoder
+            .get_or_init(|| async { self.detect_h264_encoder().await })
+            .await
+    }
+
+    async fn detect_h264_encoder(&self) -> H264Encoder {
+        let Ok(ffmpeg) = self.encoder() else {
+            return H264Encoder::X264;
+        };
+        let Ok(output) = self
+            .command(ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .await
+        else {
+            return H264Encoder::X264;
+        };
+        let encoders = String::from_utf8_lossy(&output.stdout);
+        for encoder in [H264Encoder::V4l2, H264Encoder::Omx] {
+            if !encoders.contains(encoder.name()) {
+                continue;
+            }
+            let mut command = self.command(ffmpeg);
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=5",
+                "-t",
+                "0.4",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                encoder.name(),
+                "-b:v",
+                "500k",
+                "-f",
+                "null",
+                "-",
+            ]);
+            if command
+                .output()
+                .await
+                .is_ok_and(|output| output.status.success())
+            {
+                return encoder;
+            }
+        }
+        H264Encoder::X264
     }
 
     fn command(&self, program: &Path) -> Command {
@@ -105,7 +182,7 @@ pub fn ffmpeg_command(tools: &MediaTools) -> Result<Command, AppError> {
         "-loglevel",
         "error",
         "-threads",
-        "2",
+        "4",
         "-filter_threads",
         "1",
     ]);
@@ -115,6 +192,21 @@ pub fn ffmpeg_command(tools: &MediaTools) -> Result<Command, AppError> {
 pub fn ffmpeg(tools: &MediaTools, input: &Path, seek: Option<f64>) -> Result<Command, AppError> {
     let mut command = ffmpeg_input(tools, "file,pipe", seek)?;
     command.arg(input);
+    Ok(command)
+}
+
+pub fn ffmpeg_copy(
+    tools: &MediaTools,
+    input: &Path,
+    seek: Option<f64>,
+) -> Result<Command, AppError> {
+    let mut command = ffmpeg_command(tools)?;
+    command.args(input_options("file,pipe"));
+    // 复制分片必须精确落在关键帧上，不能沿用兼容转码的 noaccurate_seek。
+    if let Some(seek) = seek {
+        command.args(["-ss", &seek.to_string()]);
+    }
+    command.arg("-i").arg(input);
     Ok(command)
 }
 

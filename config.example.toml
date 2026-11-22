@@ -18,3 +18,10 @@ addr = "0.0.0.0:7777"
 # [auth.users.operator]
 # password = ""
 # role = "editor"
+
+# 可选：转码分片磁盘缓存。兼容转码分片会写入该目录，按 LRU 淘汰；
+# 原片重封装默认直接流式输出，不写盘。路径必须可写且不能位于媒体目录内。
+# [cache]
+# path = "/mnt/usb/lantube-cache"
+# max_size_mb = 2048
+# cache_original_remux = false

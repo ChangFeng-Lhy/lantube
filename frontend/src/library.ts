@@ -1,6 +1,6 @@
 import {computed, reactive, ref, watch, type Ref} from 'vue'
 import {explore, type ExplorerItem} from './api'
-import {preferences} from './preferences'
+import {preferences, type Quality} from './preferences'
 
 const directories = reactive(new Map<string, {items: ExplorerItem[]; includeOther: boolean}>())
 const requests = new Map<string, {promise: Promise<ExplorerItem[]>; includeOther: boolean}>()
@@ -92,6 +92,13 @@ export async function findUnlistedFile(dir: string, name: string, signal: AbortS
 
 export function conversionUrl(source: string, endpoint: 'transcode' | 'thumbnail'): string {
     return source.replace(/^\/file\//, '/api/' + endpoint + '/')
+}
+
+export function transcodeUrl(source: string, profile: Quality, session?: string): string {
+    const url = new URL(conversionUrl(source, 'transcode'), location.origin)
+    url.searchParams.set('profile', profile)
+    if (session) url.searchParams.set('session', session)
+    return url.pathname + url.search
 }
 
 export function formatSize(size?: number): string {

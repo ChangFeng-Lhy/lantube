@@ -2,6 +2,7 @@ use super::{
     FRAME_RATE, MAX_SEGMENTS, MIN_TAIL_SECONDS, SEGMENT_SECONDS,
     access::ReadLease,
     audio::AudioWindow,
+    plan::Profile,
     tools::{MediaTools, ToolProcess, check_output, ffprobe, run},
 };
 use crate::error::AppError;
@@ -32,11 +33,30 @@ struct TrackTiming {
     end: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SegmentMode {
+    #[default]
+    Fixed,
+    Keyframe {
+        segment_seconds: f64,
+        start: f64,
+    },
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct PlaybackTimeline {
     picture: Range<f64>,
     pub duration: f64,
     audio: Option<usize>,
+    #[serde(default)]
+    mode: SegmentMode,
+    #[serde(default = "default_frame_rate")]
+    fps: u32,
+}
+
+fn default_frame_rate() -> u32 {
+    FRAME_RATE
 }
 
 pub struct Segment {
@@ -114,7 +134,21 @@ impl PlaybackTimeline {
         (self.duration * 1_000_000.0).round() / 1_000_000.0
     }
 
+    pub fn fps(&self) -> u32 {
+        self.fps.max(1)
+    }
+
     fn segment_count(&self) -> Result<u32, AppError> {
+        match self.mode {
+            SegmentMode::Fixed => self.fixed_segment_count(),
+            SegmentMode::Keyframe {
+                segment_seconds,
+                start,
+            } => self.keyframe_segment_count(segment_seconds, start),
+        }
+    }
+
+    fn fixed_segment_count(&self) -> Result<u32, AppError> {
         let duration = self.rounded_duration();
         let step = f64::from(SEGMENT_SECONDS);
         let count = (duration / step).ceil();
@@ -129,7 +163,55 @@ impl PlaybackTimeline {
         Ok(count)
     }
 
+    fn keyframe_segment_count(&self, step: f64, start: f64) -> Result<u32, AppError> {
+        let duration = self.rounded_duration();
+        if !step.is_finite()
+            || step <= 0.0
+            || !start.is_finite()
+            || start < 0.0
+            || start >= duration
+        {
+            return Err(AppError::bad_request("Unsupported video duration"));
+        }
+        let count = ((duration - start) / step).ceil();
+        if !count.is_finite() || count < 1.0 || count > f64::from(MAX_SEGMENTS) {
+            return Err(AppError::bad_request("Unsupported video duration"));
+        }
+        let mut count = count as u32;
+        // 尾段太短时并入上一段，避免生成没有可复制画面的分片。
+        if count > 1 && duration - (start + f64::from(count - 1) * step) < MIN_TAIL_SECONDS {
+            count -= 1;
+        }
+        Ok(count)
+    }
+
     fn segment_at(&self, index: u32, count: u32) -> Segment {
+        match self.mode {
+            SegmentMode::Fixed => self.fixed_segment_at(index, count),
+            SegmentMode::Keyframe {
+                segment_seconds,
+                start,
+            } => {
+                let offset = start + f64::from(index) * segment_seconds;
+                let duration = self.rounded_duration();
+                let length = if index + 1 == count {
+                    duration - offset
+                } else {
+                    (duration - offset).min(segment_seconds)
+                };
+                Segment {
+                    offset,
+                    length,
+                    picture: None,
+                    seek: offset,
+                    audio: self.audio,
+                    audio_window: None,
+                }
+            }
+        }
+    }
+
+    fn fixed_segment_at(&self, index: u32, count: u32) -> Segment {
         let step = f64::from(SEGMENT_SECONDS);
         let offset = f64::from(index) * step;
         let length = if index + 1 == count {
@@ -197,8 +279,14 @@ impl PlaybackTimeline {
 
     pub fn playlist_chunks(self, token: String) -> Result<impl Iterator<Item = String>, AppError> {
         let count = self.segment_count()?;
+        let target_duration = match self.mode {
+            SegmentMode::Fixed => SEGMENT_SECONDS,
+            SegmentMode::Keyframe {
+                segment_seconds, ..
+            } => segment_seconds.ceil() as u32,
+        };
         let header = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{SEGMENT_SECONDS}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n"
         );
         // 相对 URI 复用清单路径；分批生成，避免在内存里展开整份长清单。
         let chunks = (0..count)
@@ -242,6 +330,10 @@ struct ProbedStream {
     index: u32,
     #[serde(default)]
     codec_type: String,
+    #[serde(default)]
+    codec_name: Option<String>,
+    #[serde(default)]
+    r_frame_rate: Option<String>,
     #[serde(flatten)]
     timing: ProbedTiming,
     #[serde(default)]
@@ -340,6 +432,26 @@ impl ProbedStream {
         finite(self.timing.start_time.as_deref())
     }
 
+    fn codec_name(&self) -> Option<&str> {
+        self.codec_name.as_deref()
+    }
+
+    fn fps(&self) -> u32 {
+        self.r_frame_rate
+            .as_deref()
+            .and_then(|value| {
+                let (numerator, denominator) = value.split_once('/')?;
+                let numerator = numerator.parse::<f64>().ok()?;
+                let denominator = denominator.parse::<f64>().ok()?;
+                (denominator > 0.0)
+                    .then_some(numerator / denominator)
+                    .filter(|fps| fps.is_finite() && *fps > 0.0)
+            })
+            .map_or(FRAME_RATE, |fps| {
+                fps.round().clamp(1.0, f64::from(FRAME_RATE)) as u32
+            })
+    }
+
     fn tagged_end(&self) -> Option<f64> {
         // Matroska 的 DURATION 标签记录轨道末尾的时间戳。
         let (hours, value) = self.tags.get("DURATION")?.split_once(':')?;
@@ -357,7 +469,7 @@ async fn probe_media(
         ffprobe(tools)?
             .args([
                 "-show_entries",
-                "stream=index,codec_type,start_time,duration:stream_tags=DURATION:stream_disposition=attached_pic,default:format=format_name,start_time,duration",
+                "stream=index,codec_type,codec_name,start_time,duration,r_frame_rate:stream_tags=DURATION:stream_disposition=attached_pic,default:format=format_name,start_time,duration",
                 "-of",
                 "json",
                 "-i",
@@ -376,11 +488,16 @@ pub async fn playback_timeline(
     input: &Path,
     method: Method,
     read: &ReadLease,
+    profile: Profile,
 ) -> Result<Option<PlaybackTimeline>, AppError> {
     let probe = probe_media(tools, input, read).await?;
     let video = probe.video()?;
     tools.encoder()?;
-    build_playback_timeline(tools, input, method, read, &probe, video).await
+    if profile.is_original() {
+        original_timeline(tools, input, method, read, &probe, video).await
+    } else {
+        build_playback_timeline(tools, input, method, read, &probe, video).await
+    }
 }
 
 async fn build_playback_timeline(
@@ -475,7 +592,160 @@ async fn build_playback_timeline(
         picture: picture.start..video_end,
         duration,
         audio: selected_audio.map(|(index, _)| index),
+        mode: SegmentMode::Fixed,
+        fps: video.fps(),
     }))
+}
+
+async fn original_timeline(
+    tools: &MediaTools,
+    input: &Path,
+    method: Method,
+    read: &ReadLease,
+    probe: &MediaProbe,
+    video: &ProbedStream,
+) -> Result<Option<PlaybackTimeline>, AppError> {
+    // 只对浏览器普遍支持的 H.264 做无重编码重封装。
+    if video.codec_name() != Some("h264") {
+        return Err(unsupported_original());
+    }
+    let Some(mut timeline) =
+        build_playback_timeline(tools, input, method, read, probe, video).await?
+    else {
+        return Ok(None);
+    };
+    // 长段无画面/无音频的区间不适合直接复制，交给兼容转码处理。
+    if timeline.picture.start > 0.75
+        || timeline.picture.end < timeline.duration - 0.75
+        || timeline.duration <= 1.0
+    {
+        return Err(unsupported_original());
+    }
+    let origin = probe.origin();
+    let keyframes = probe_keyframes(tools, input, video.index, read).await?;
+    if keyframes.len() < 2 {
+        return Err(unsupported_original());
+    }
+    let mut intervals: Vec<f64> = keyframes
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .filter(|interval| *interval > 0.01)
+        .collect();
+    if intervals.is_empty() {
+        return Err(unsupported_original());
+    }
+    intervals.sort_by(f64::total_cmp);
+    let median = intervals[intervals.len() / 2];
+    let tolerance = (median * 0.08).max(0.12);
+    if intervals
+        .iter()
+        .any(|interval| (*interval - median).abs() > tolerance)
+    {
+        // 关键帧不规则时无法用固定步长生成可复制的分片。
+        return Err(unsupported_original());
+    }
+    let multiplier = (f64::from(SEGMENT_SECONDS) / median).round().max(1.0);
+    let segment_seconds = median * multiplier;
+    let start = (keyframes[0] - origin).max(0.0);
+    if !segment_seconds.is_finite()
+        || segment_seconds <= 0.0
+        || start > 0.75
+        || timeline.duration <= start + 0.5
+    {
+        return Err(unsupported_original());
+    }
+    timeline.mode = SegmentMode::Keyframe {
+        segment_seconds,
+        start,
+    };
+    timeline.segment_count()?;
+    Ok(Some(timeline))
+}
+
+async fn probe_keyframes(
+    tools: &MediaTools,
+    input: &Path,
+    video_index: u32,
+    read: &ReadLease,
+) -> Result<Vec<f64>, AppError> {
+    // 读取包标记比 skip_frame 解码所有关键帧快得多，长视频清单生成时间可降低数倍。
+    let output = run(
+        ffprobe(tools)?
+            .args([
+                "-select_streams",
+                &video_index.to_string(),
+                "-show_entries",
+                "packet=pts_time,flags",
+                "-of",
+                "csv=p=0",
+                "-i",
+            ])
+            .arg(input),
+        "ffprobe",
+        read,
+    )
+    .await?;
+    let mut times = packet_keyframes(&output);
+    if times.is_empty() {
+        // 少数封装格式不提供包级关键帧标记，退回逐帧探测。
+        let output = run(
+            ffprobe(tools)?
+                .args([
+                    "-select_streams",
+                    &video_index.to_string(),
+                    "-skip_frame",
+                    "nokey",
+                    "-show_entries",
+                    "frame=pts_time",
+                    "-of",
+                    "csv=p=0",
+                    "-i",
+                ])
+                .arg(input),
+            "ffprobe",
+            read,
+        )
+        .await?;
+        times = frame_keyframes(&output);
+    }
+    Ok(times)
+}
+
+fn packet_keyframes(output: &[u8]) -> Vec<f64> {
+    let mut times: Vec<f64> = String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let (time, flags) = line.split_once(',')?;
+            flags
+                .starts_with('K')
+                .then(|| time.trim().parse::<f64>().ok())?
+        })
+        .filter(|time| time.is_finite())
+        .collect();
+    normalize_keyframes(&mut times);
+    times
+}
+
+fn frame_keyframes(output: &[u8]) -> Vec<f64> {
+    let mut times: Vec<f64> = String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.split(',').next()?.trim().parse::<f64>().ok())
+        .filter(|time| time.is_finite())
+        .collect();
+    normalize_keyframes(&mut times);
+    times
+}
+
+fn normalize_keyframes(times: &mut Vec<f64>) {
+    times.sort_by(f64::total_cmp);
+    times.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+}
+
+fn unsupported_original() -> AppError {
+    AppError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "Original playback is not supported for this file",
+    )
 }
 
 fn finite(value: Option<&str>) -> Option<f64> {
@@ -662,7 +932,11 @@ mod tests {
         .unwrap();
         assert_eq!(timeline.audio, Some(0));
         // 现有兼容播放占满名额时，章节校验仍可运行。
-        let _playback = super::super::PLAYBACK_SLOTS.acquire_many(2).await.unwrap();
+        let _playback = super::super::PLAYBACK_SLOTS
+            .global
+            .acquire_many(2)
+            .await
+            .unwrap();
         let duration = timeout(
             Duration::from_secs(5),
             super::super::probe_chapter_duration(&tools, &input, &read),
@@ -681,6 +955,8 @@ mod tests {
                 picture,
                 duration: 60.125,
                 audio: Some(0),
+                mode: SegmentMode::Fixed,
+                fps: FRAME_RATE,
             };
             let last = timeline.segment(14).unwrap();
             assert_eq!(last.offset + last.length, 60.125);
@@ -720,6 +996,8 @@ mod tests {
             picture: 13.5..28.0,
             duration: 128.0,
             audio: Some(0),
+            mode: SegmentMode::Fixed,
+            fps: FRAME_RATE,
         };
         let leading = timeline.segment(1).unwrap();
         assert_eq!(leading.picture, None);
@@ -758,11 +1036,54 @@ mod tests {
             picture,
             duration,
             audio: None,
+            mode: SegmentMode::Fixed,
+            fps: FRAME_RATE,
         }
     }
 
     fn playlist(timeline: PlaybackTimeline) -> Result<String, AppError> {
         Ok(timeline.playlist_chunks("token".into())?.collect())
+    }
+
+    #[test]
+    fn keyframe_segments_follow_fixed_keyframe_spacing() {
+        let timeline = PlaybackTimeline {
+            picture: 0.0..12.3,
+            duration: 12.3,
+            audio: Some(0),
+            mode: SegmentMode::Keyframe {
+                segment_seconds: 6.0,
+                start: 0.0,
+            },
+            fps: 25,
+        };
+        assert_eq!(timeline.segment_count().unwrap(), 2);
+        let first = timeline.segment(0).unwrap();
+        assert_eq!((first.offset, first.length), (0.0, 6.0));
+        assert!(first.picture.is_none());
+        let last = timeline.segment(1).unwrap();
+        assert_eq!(last.offset, 6.0);
+        assert!((last.length - 6.3).abs() < 1e-9);
+        let playlist = playlist(timeline).unwrap();
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:6"));
+        assert!(playlist.contains("#EXTINF:6.000000,"));
+        assert!(playlist.contains("#EXTINF:6.300000,"));
+    }
+
+    #[test]
+    fn keyframe_segments_merge_a_short_tail() {
+        let timeline = PlaybackTimeline {
+            picture: 0.0..12.2,
+            duration: 12.2,
+            audio: None,
+            mode: SegmentMode::Keyframe {
+                segment_seconds: 6.0,
+                start: 0.0,
+            },
+            fps: 30,
+        };
+        assert_eq!(timeline.segment_count().unwrap(), 2);
+        assert!((timeline.segment(1).unwrap().length - 6.2).abs() < 1e-9);
     }
 
     #[test]
@@ -850,6 +1171,8 @@ mod tests {
             picture: 6.0..11.0,
             duration: 17.0,
             audio: Some(1),
+            mode: SegmentMode::Fixed,
+            fps: FRAME_RATE,
         };
         for (index, picture) in [None, Some(2.0..4.0), Some(0.0..3.0), None, None]
             .into_iter()
@@ -906,5 +1229,11 @@ mod tests {
         let timing = probe.timing(video, Some(13.52));
         assert_eq!(timing.start, 13.52);
         assert_eq!(timing.end, Some(17.52));
+    }
+    #[test]
+    fn extracts_sorted_unique_keyframe_packet_times() {
+        let packets = b"12.000000,K_\n0.000000,K__\n0.040000,__\n6.000000,__\n6.000000,K__\n";
+        assert_eq!(packet_keyframes(packets), vec![0.0, 6.0, 12.0]);
+        assert_eq!(frame_keyframes(b"6.0\n0.0\n6.0\n"), vec![0.0, 6.0]);
     }
 }

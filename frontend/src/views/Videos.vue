@@ -12,10 +12,11 @@ import {chapterAt, chapterTime, maxChapters, maxChapterTitle, minChapterMs, pars
 import ChapterList from '../components/ChapterList.vue'
 import MediaCover from '../components/MediaCover.vue'
 import {
-    canWrite, conversionUrl, directoryPath, extension, findUnlistedFile, formatSize, isAudio, joinPath, libraryRoute, mediaUrl,
-    orderedFiles, playerRoute, title, useDirectory,
+    canWrite, directoryPath, extension, findUnlistedFile, formatSize, isAudio, joinPath, libraryRoute, mediaUrl,
+    orderedFiles, playerRoute, title, transcodeUrl, useDirectory,
 } from '../library'
 import {unloadMedia, useMediaSource} from '../mediaSource'
+import {preferences, qualityOptions, type Quality} from '../preferences'
 import {formatTime} from '../thumbnails'
 
 const {t} = useI18n()
@@ -49,16 +50,29 @@ type CompatibilityFailure = 'transcodeUnavailable' | 'transcodeFailed' | 'transc
 const failure = ref<CompatibilityFailure>()
 const directFailed = ref(false)
 const compatible = ref(false)
+const activeProfile = ref<Quality>()
+const qualityNotice = ref<'originalUnavailable'>()
+const systemBufferNotice = ref(false)
 const audioLayout = computed(() => !compatible.value && !directFailed.value && (directPicture.value === undefined ? audio.value : !directPicture.value))
-const playbackBlocked = computed(() => compatible.value ? !!failure.value : directFailed.value)
+const playbackBlocked = computed(() => compatible.value
+    ? !!failure.value
+    : directFailed.value || (!!failure.value && !compatibilityProbe.value))
 const compatibilityProbe = shallowRef<AbortController>()
 const waitingForPicture = ref(false)
 const pictureAvailable = computed(() => compatible.value ? !waitingForPicture.value && !failure.value : directPicture.value === true)
-const preparing = computed(() => waitingForPicture.value || (directFailed.value && !!compatibilityProbe.value))
+const preparing = computed(() => waitingForPicture.value || !!compatibilityProbe.value)
 let hls: Hls | undefined
 let playRequested = false
-let attemptedCompatibility = false
 let playbackGeneration = 0
+const playbackSession = ref(newSessionId())
+
+function newSessionId() {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36)
+}
+
+function qualityLabel(quality: Quality) {
+    return t(`quality${quality === 'original' ? 'Original' : quality === '1080p' ? '1080' : quality === '720p' ? '720' : '480'}`)
+}
 const duration = ref(0)
 const time = ref(0)
 const volume = ref(1)
@@ -301,22 +315,31 @@ function unloadPlayback() {
     hls = undefined
     unloadMedia(video.value)
     compatible.value = false
+    activeProfile.value = undefined
     waitingForPicture.value = false
+    qualityNotice.value = undefined
+    systemBufferNotice.value = false
 }
 
-async function playOriginal() {
-    const position = video.value?.currentTime ?? 0
-    unloadPlayback()
-    playRequested = true
-    const generation = playbackGeneration
-    failure.value = undefined
-    directFailed.value = false
-    await nextTick()
+function startDirect(position = 0) {
     const media = video.value
-    if (generation !== playbackGeneration || !media) return
-    media.currentTime = position
-    setSpeed()
-    if (playRequested) void play()
+    if (!src.value || !media) return
+    compatible.value = false
+    activeProfile.value = undefined
+    directFailed.value = false
+    media.src = src.value
+    media.load()
+    const apply = () => {
+        if (!video.value) return
+        const target = Number.isFinite(video.value.duration)
+            ? Math.min(position, video.value.duration)
+            : position
+        video.value.currentTime = target
+        setSpeed()
+        if (playRequested) void play()
+    }
+    if (media.readyState >= HTMLMediaElement.HAVE_METADATA) apply()
+    else media.addEventListener('loadedmetadata', apply, {once: true})
 }
 
 function compatibilityFailed(reason: CompatibilityFailure) {
@@ -329,6 +352,7 @@ function compatibilityProbeFailed(media: HTMLVideoElement, status: number | unde
     const playable = !media.error && media.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
     if (status === 422) {
         audioOnly.value = true
+        startDirect(0)
         return
     }
     // 浏览器可能只解出了音轨。自动探测失败时保留手动入口。
@@ -336,26 +360,36 @@ function compatibilityProbeFailed(media: HTMLVideoElement, status: number | unde
     failure.value = transcodeError(status)
 }
 
-async function startCompatible(requestedByUser = false) {
+async function startHls(profile: Quality, requestedByUser = false, positionOverride?: number, notice?: 'originalUnavailable') {
     const media = video.value
-    if (!src.value || !media || compatible.value || compatibilityProbe.value || audioOnly.value) return
-    const url = conversionUrl(src.value, 'transcode')
+    if (!src.value || !media || audioOnly.value) return
+    const position = positionOverride ?? media.currentTime
     let generation = playbackGeneration
     const probe = new AbortController()
+    compatibilityProbe.value?.abort()
     compatibilityProbe.value = probe
     if (requestedByUser) playRequested = true
-    attemptedCompatibility = true
     failure.value = undefined
+    qualityNotice.value = notice
+    systemBufferNotice.value = false
+    hls?.destroy()
+    hls = undefined
+    compatible.value = false
+    activeProfile.value = undefined
+    waitingForPicture.value = false
 
     try {
         const {default: HlsPlayer} = await import('hls.js/light')
         if (generation !== playbackGeneration) return
         const useHls = HlsPlayer.isSupported()
-        if (!useHls && !media.canPlayType('application/vnd.apple.mpegurl')) {
-            failure.value = 'transcodeUnsupported'
+        const nativeHls = !useHls && !!media.canPlayType('application/vnd.apple.mpegurl')
+        if (!useHls && !nativeHls) {
+            systemBufferNotice.value = true
+            startDirect(position)
             return
         }
 
+        const url = transcodeUrl(src.value, profile, playbackSession.value)
         let trackDuration = 0
         if (useHls) {
             // 每次加载都可能启动转码，失败后由用户决定是否再试。
@@ -369,12 +403,14 @@ async function startCompatible(requestedByUser = false) {
             }
             const player = new HlsPlayer({
                 autoStartLoad: false,
-                maxBufferLength: 12,
-                backBufferLength: 16,
+                maxBufferLength: preferences.forwardBufferSeconds,
+                backBufferLength: preferences.backBufferSeconds,
+                maxBufferSize: 120 * 1000 * 1000,
                 manifestLoadPolicy: conversionLoadPolicy,
                 fragLoadPolicy: conversionLoadPolicy,
             })
             hls = player
+            let fallback = false
             // 先加载播放器自己的清单，成功后才替换原片。
             const duration = await new Promise<number | undefined>((resolve) => {
                 probe.signal.addEventListener('abort', () => resolve(undefined), {once: true})
@@ -384,29 +420,42 @@ async function startCompatible(requestedByUser = false) {
                 player.on(HlsPlayer.Events.ERROR, (_, details) => {
                     if (generation !== playbackGeneration || !details.fatal) return
                     const status = details.response?.code
-                    if (compatible.value) compatibilityFailed(transcodeError(status))
-                    else {
-                        compatibilityProbeFailed(media, status, requestedByUser)
+                    if (profile === 'original' && !fallback && [422, 502, 503].includes(status ?? 0)) {
+                        fallback = true
                         resolve(undefined)
+                        window.setTimeout(() => {
+                            if (generation === playbackGeneration) {
+                                void startHls('720p', requestedByUser, position, 'originalUnavailable')
+                            }
+                        }, 0)
+                        return
                     }
+                    if (compatible.value) compatibilityFailed(transcodeError(status))
+                    else compatibilityProbeFailed(media, status, requestedByUser)
+                    resolve(undefined)
                 })
                 player.loadSource(url)
             })
             if (duration === undefined) return
             trackDuration = duration
         } else {
+            systemBufferNotice.value = true
             const response = await fetch(url, {method: 'HEAD', signal: probe.signal})
             if (generation !== playbackGeneration) return
             if (!response.ok) {
+                if (profile === 'original' && response.status === 422) {
+                    await startHls('720p', requestedByUser, position, 'originalUnavailable')
+                    return
+                }
                 compatibilityProbeFailed(media, response.status, requestedByUser)
                 return
             }
         }
         if (generation !== playbackGeneration || failure.value || audioOnly.value) return
-        const position = media.currentTime
         generation = ++playbackGeneration
         directFailed.value = false
         compatible.value = true
+        activeProfile.value = profile
         waitingForPicture.value = true
         playing.value = false
         await nextTick()
@@ -439,6 +488,25 @@ async function startCompatible(requestedByUser = false) {
     }
 }
 
+function switchQuality(next: Quality) {
+    const current = activeProfile.value ?? preferences.quality
+    if (next === current) {
+        preferences.quality = next
+        return
+    }
+    preferences.quality = next
+    const media = video.value
+    const position = media?.currentTime ?? 0
+    const wasPlaying = !!media && !media.paused
+    playRequested = wasPlaying
+    unloadPlayback()
+    void nextTick().then(() => startHls(next, wasPlaying, position))
+}
+
+function onQualityChange(event: Event) {
+    switchQuality((event.target as HTMLSelectElement).value as Quality)
+}
+
 function transcodeError(status?: number): CompatibilityFailure {
     if (status === 503) return 'transcodeUnavailable'
     if (status === 409) return 'sourceChanged'
@@ -452,7 +520,6 @@ function onMediaError() {
         return
     }
     directFailed.value = true
-    if (!attemptedCompatibility) void startCompatible()
 }
 
 function onMediaData() {
@@ -464,7 +531,6 @@ function onMediaData() {
     }
     directFailed.value = false
     directPicture.value = media.videoWidth > 0
-    if (!media.videoWidth && !attemptedCompatibility) void startCompatible()
 }
 
 function togglePlayback() {
@@ -615,7 +681,6 @@ watch(src, async (source, _, onCleanup) => {
     closeChapterEditor(false)
     chapterPicker.value?.close()
     playRequested = playMode.value === 'automatic'
-    attemptedCompatibility = false
     audioOnly.value = false
     directPicture.value = undefined
     failure.value = undefined
@@ -623,12 +688,19 @@ watch(src, async (source, _, onCleanup) => {
     playing.value = false
     time.value = 0
     duration.value = 0
+    playbackSession.value = newSessionId()
+    qualityNotice.value = undefined
+    systemBufferNotice.value = false
     await nextTick()
     if (superseded || !source || !video.value) return
     video.value.volume = volume.value
     video.value.muted = muted.value
     setSpeed()
-    if (playRequested) void play()
+    if (audio.value) {
+        startDirect(0)
+        return
+    }
+    await startHls(preferences.quality, playRequested)
 }, {immediate: true})
 
 watch([index, railTab], async () => {
@@ -692,7 +764,7 @@ const supportsPip = document.pictureInPictureEnabled
                         tabindex="0" :aria-label="t('player')" role="region" @keydown="playerKeys"
                         @pointermove="onPlayerPointerMove">
                         <div class="picture" :class="{'audio-picture': audioLayout}">
-                            <video ref="video" :src="compatible ? undefined : src || undefined" playsinline preload="metadata"
+                            <video ref="video" playsinline preload="auto"
                                 @click="onPictureClick" @durationchange="mediaTime" @timeupdate="mediaTime"
                                 @volumechange="mediaVolume" @play="playing = true" @pause="playing = false"
                                 @ended="ended" @loadeddata="onMediaData" @error="onMediaError"></video>
@@ -864,11 +936,16 @@ const supportsPip = document.pictureInPictureEnabled
                     </div>
 
                     <div class="play-preferences">
-                        <button v-if="!audioOnly" class="button quiet" type="button" :aria-pressed="compatible"
-                            :disabled="!compatible && !!compatibilityProbe"
-                            @click="compatible ? playOriginal() : startCompatible(true)">
-                            <Film :size="17" />{{ t(compatible ? 'originalPlayback' : 'compatiblePlayback') }}
-                        </button>
+                        <label v-if="!audio && !audioOnly" class="play-pref">
+                            <Film :size="17" /><span class="sr-only">{{ t('quality') }}</span>
+                            <select class="select" :value="activeProfile ?? preferences.quality"
+                                :aria-label="t('quality')" :title="t('quality')"
+                                :disabled="!!compatibilityProbe" @change="onQualityChange">
+                                <option v-for="quality in qualityOptions" :key="quality" :value="quality">
+                                    {{ qualityLabel(quality) }}
+                                </option>
+                            </select>
+                        </label>
                         <label class="play-pref">
                             <Repeat2 :size="17" /><span class="sr-only">{{ t('playMode') }}</span>
                             <select v-model="playMode" class="select">
@@ -887,6 +964,8 @@ const supportsPip = document.pictureInPictureEnabled
                         </label>
                     </div>
                     <p v-if="failure && !playbackBlocked" class="play-notice" role="status">{{ t(failure) }}</p>
+                    <p v-if="qualityNotice" class="play-notice" role="status">{{ t(qualityNotice) }}</p>
+                    <p v-if="systemBufferNotice" class="play-notice" role="status">{{ t('systemBufferNotice') }}</p>
                 </div>
 
                 <aside class="queue" :aria-label="t(railTab)">
