@@ -85,6 +85,10 @@ const bufferedSegments = computed(() => bufferedRanges.value.map(range => ({
     left: duration.value ? range.start / duration.value * 100 + '%' : '0%',
     width: duration.value ? Math.max(0.15, (range.end - range.start) / duration.value * 100) + '%' : '0%',
 })))
+const playedWidth = computed(() => {
+    const progress = duration.value > 0 ? Math.min(1, Math.max(0, time.value / duration.value)) : 0
+    return {width: `${progress * 100}%`}
+})
 const duration = ref(0)
 const time = ref(0)
 const volume = ref(1)
@@ -1099,7 +1103,10 @@ const supportsPip = document.pictureInPictureEnabled
                         <div class="player-chrome" @click="showControls" @pointerdown="holdControls" @pointerup="releaseControls"
                             @pointerenter="holdControls" @pointerleave="releaseControls" @focusin="holdControls" @focusout="releaseControls">
                         <div class="controls">
-                            <div class="timeline" :class="{'has-chapters': chapterSegments.length}">
+                            <div class="timeline">
+                                <div class="seek-track" aria-hidden="true">
+                                    <span class="seek-fill" :style="playedWidth"></span>
+                                </div>
                                 <div v-if="bufferedSegments.length" class="buffer-track" aria-hidden="true">
                                     <span v-for="(segment, bufferIndex) in bufferedSegments" :key="bufferIndex"
                                         :style="{left: segment.left, width: segment.width}"></span>
@@ -1347,18 +1354,21 @@ const supportsPip = document.pictureInPictureEnabled
 
 .controls { padding: 3px 12px 7px; background: #191c23; }
 .seek, .volume { display: block; margin: 0; accent-color: var(--accent); cursor: pointer; }
-.seek { width: 100%; height: 17px; }
-.timeline { position: relative; display: grid; align-items: center; min-height: 22px; }
-.buffer-track { position: absolute; inset-inline: 6px; top: 3px; z-index: 2; height: 3px; pointer-events: none; }
-.buffer-track span { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 2px; background: #e7ebf566; box-shadow: 0 0 7px #e7ebf526; }
-.chapter-track { position: absolute; inset-inline: 6px; display: flex; height: 5px; pointer-events: none; }
+.seek { width: 100%; height: 100%; }
+.timeline { position: relative; min-height: 22px; }
+.seek-track, .buffer-track, .chapter-track { position: absolute; inset-inline: 6px; top: 50%; transform: translateY(-50%); pointer-events: none; }
+.seek-track { z-index: 0; height: 4px; overflow: hidden; border-radius: 2px; background: #494e5c; }
+.seek-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.buffer-track { z-index: 3; height: 4px; }
+.buffer-track span { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 2px; background: #e7ebf5a8; box-shadow: 0 0 7px #e7ebf533; }
+.chapter-track { z-index: 2; display: flex; height: 4px; overflow: hidden; border-radius: 2px; }
 .chapter-track span { min-width: 0; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--fill), #494e5c var(--fill)); }
 .chapter-track span:not(:last-child) { box-shadow: inset -2px 0 #191c23; }
-.has-chapters .seek { position: relative; appearance: none; background: transparent; }
-.has-chapters .seek::-webkit-slider-runnable-track { height: 14px; background: none; }
-.has-chapters .seek::-moz-range-track { height: 14px; background: none; }
-.has-chapters .seek::-webkit-slider-thumb { appearance: none; width: 13px; height: 13px; border: 2px solid #191c23; border-radius: 50%; background: var(--accent); }
-.has-chapters .seek::-moz-range-thumb { width: 10px; height: 10px; border: 2px solid #191c23; border-radius: 50%; background: var(--accent); }
+.seek { position: absolute; inset: 0; z-index: 4; appearance: none; background: transparent; }
+.seek::-webkit-slider-runnable-track { height: 22px; background: none; }
+.seek::-moz-range-track { height: 22px; background: none; }
+.seek::-webkit-slider-thumb { appearance: none; width: 13px; height: 13px; margin-top: 4px; border: 2px solid #191c23; border-radius: 50%; background: var(--accent); }
+.seek::-moz-range-thumb { width: 10px; height: 10px; border: 2px solid #191c23; border-radius: 50%; background: var(--accent); }
 .control-row { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .control { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--text); }
 .control:hover:not(:disabled), .speed:hover { background: var(--raised); }
