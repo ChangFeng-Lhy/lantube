@@ -16,7 +16,7 @@ import {
     orderedFiles, playerRoute, title, transcodeUrl, useDirectory,
 } from '../library'
 import {unloadMedia, useMediaSource} from '../mediaSource'
-import {preferences, qualityOptions, type Quality} from '../preferences'
+import {bufferTargets, preferences, profileBitrate, qualityOptions, type Quality} from '../preferences'
 import {formatTime} from '../thumbnails'
 
 const {t} = useI18n()
@@ -43,7 +43,13 @@ const audioOnly = ref(false)
 const directPicture = ref<boolean>()
 
 const stage = ref<HTMLElement>()
-const video = ref<HTMLVideoElement>()
+type VideoSlot = 'primary' | 'secondary'
+const primaryVideo = ref<HTMLVideoElement>()
+const secondaryVideo = ref<HTMLVideoElement>()
+const activeSlot = ref<VideoSlot>('primary')
+const video = computed(() => activeSlot.value === 'primary' ? primaryVideo.value : secondaryVideo.value)
+const switchingQuality = ref(false)
+const bufferedRanges = ref<Array<{start: number; end: number}>>([])
 const queue = ref<HTMLElement>()
 const playing = ref(false)
 type CompatibilityFailure = 'transcodeUnavailable' | 'transcodeFailed' | 'transcodeUnsupported' | 'sourceChanged'
@@ -51,7 +57,7 @@ const failure = ref<CompatibilityFailure>()
 const directFailed = ref(false)
 const compatible = ref(false)
 const activeProfile = ref<Quality>()
-const qualityNotice = ref<'originalUnavailable'>()
+const qualityNotice = ref<'originalUnavailable' | 'qualitySwitchFailed'>()
 const systemBufferNotice = ref(false)
 const audioLayout = computed(() => !compatible.value && !directFailed.value && (directPicture.value === undefined ? audio.value : !directPicture.value))
 const playbackBlocked = computed(() => compatible.value
@@ -62,6 +68,8 @@ const waitingForPicture = ref(false)
 const pictureAvailable = computed(() => compatible.value ? !waitingForPicture.value && !failure.value : directPicture.value === true)
 const preparing = computed(() => waitingForPicture.value || !!compatibilityProbe.value)
 let hls: Hls | undefined
+let switchHls: Hls | undefined
+let switchAbort: AbortController | undefined
 let playRequested = false
 let playbackGeneration = 0
 const playbackSession = ref(newSessionId())
@@ -73,6 +81,10 @@ function newSessionId() {
 function qualityLabel(quality: Quality) {
     return t(`quality${quality === 'original' ? 'Original' : quality === '1080p' ? '1080' : quality === '720p' ? '720' : '480'}`)
 }
+const bufferedSegments = computed(() => bufferedRanges.value.map(range => ({
+    left: duration.value ? range.start / duration.value * 100 + '%' : '0%',
+    width: duration.value ? Math.max(0.15, (range.end - range.start) / duration.value * 100) + '%' : '0%',
+})))
 const duration = ref(0)
 const time = ref(0)
 const volume = ref(1)
@@ -84,6 +96,7 @@ const playMode = ref<'automatic' | 'manual'>('automatic')
 const sleepMinutes = ref(0)
 let timer: number | undefined
 let controlsTimer: number | undefined
+let bufferTimer: number | undefined
 
 const {src, revision: mediaRevision, loading: mediaLoading, failed: mediaLoadFailed, reload: reloadMedia} =
     useMediaSource(fileSource, unloadPlayback)
@@ -307,13 +320,124 @@ function pause() {
     video.value?.pause()
 }
 
+function videoForSlot(slot: VideoSlot): HTMLVideoElement | undefined {
+    return slot === 'primary' ? primaryVideo.value : secondaryVideo.value
+}
+
+function isActiveEvent(event: Event) {
+    return event.currentTarget === video.value
+}
+
+function updateBuffered() {
+    const media = video.value
+    if (!media) {
+        bufferedRanges.value = []
+        return
+    }
+    const ranges: Array<{start: number; end: number}> = []
+    for (let index = 0; index < media.buffered.length; index++) {
+        const start = media.buffered.start(index)
+        const end = media.buffered.end(index)
+        if (end > start) ranges.push({start, end})
+    }
+    bufferedRanges.value = ranges
+}
+
+function sourceBitrate(profile: Quality, trackDuration: number): number {
+    const known = profileBitrate(profile)
+    if (known) return known
+    const size = current.value?.size
+    return size && trackDuration > 0 ? size * 8 / trackDuration : 8_000_000
+}
+
+function applyBufferConfig(player: Hls, bitrate: number) {
+    const targets = bufferTargets(preferences.bufferMegabytes, bitrate)
+    player.config.maxBufferLength = targets.forwardSeconds
+    player.config.maxMaxBufferLength = targets.forwardSeconds
+    player.config.maxBufferSize = targets.forwardBytes
+    player.config.backBufferLength = targets.backSeconds
+}
+
+function waitForPlayable(media: HTMLVideoElement, position: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const done = (error?: Error) => {
+            window.clearTimeout(timeout)
+            media.removeEventListener('canplay', check)
+            media.removeEventListener('loadeddata', check)
+            media.removeEventListener('progress', check)
+            signal.removeEventListener('abort', aborted)
+            if (error) reject(error)
+            else resolve()
+        }
+        const check = () => {
+            if (signal.aborted) return done(new DOMException('Aborted', 'AbortError'))
+            if (media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return
+            for (let index = 0; index < media.buffered.length; index++) {
+                if (media.buffered.start(index) <= position + 0.25 && media.buffered.end(index) > position + 0.5) {
+                    done()
+                    return
+                }
+            }
+        }
+        const aborted = () => done(new DOMException('Aborted', 'AbortError'))
+        const timeout = window.setTimeout(() => done(new Error('Quality switch timed out')), 8_000)
+        media.addEventListener('canplay', check)
+        media.addEventListener('loadeddata', check)
+        media.addEventListener('progress', check)
+        signal.addEventListener('abort', aborted, {once: true})
+        check()
+    })
+}
+
+function waitForSwitchBuffer(media: HTMLVideoElement, source: HTMLVideoElement, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const done = (error?: Error) => {
+            window.clearTimeout(timeout)
+            media.removeEventListener('canplay', check)
+            media.removeEventListener('progress', check)
+            media.removeEventListener('timeupdate', check)
+            source.removeEventListener('timeupdate', check)
+            signal.removeEventListener('abort', aborted)
+            if (error) reject(error)
+            else resolve()
+        }
+        const check = () => {
+            if (signal.aborted) return done(new DOMException('Aborted', 'AbortError'))
+            if (media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return
+            const at = source.currentTime
+            const wanted = Math.min(at + 6, media.duration || Infinity)
+            for (let index = 0; index < media.buffered.length; index++) {
+                if (media.buffered.start(index) <= at + 0.1 && media.buffered.end(index) >= wanted) {
+                    done()
+                    return
+                }
+            }
+        }
+        const aborted = () => done(new DOMException('Aborted', 'AbortError'))
+        const timeout = window.setTimeout(() => done(new Error('Quality switch timed out')), 25_000)
+        media.addEventListener('canplay', check)
+        media.addEventListener('progress', check)
+        media.addEventListener('timeupdate', check)
+        source.addEventListener('timeupdate', check)
+        signal.addEventListener('abort', aborted, {once: true})
+        check()
+    })
+}
+
 function unloadPlayback() {
     playbackGeneration++
+    switchAbort?.abort()
+    switchAbort = undefined
+    switchHls?.destroy()
+    switchHls = undefined
     compatibilityProbe.value?.abort()
     compatibilityProbe.value = undefined
     hls?.destroy()
     hls = undefined
-    unloadMedia(video.value)
+    unloadMedia(primaryVideo.value)
+    unloadMedia(secondaryVideo.value)
+    activeSlot.value = 'primary'
+    bufferedRanges.value = []
     compatible.value = false
     activeProfile.value = undefined
     waitingForPicture.value = false
@@ -401,11 +525,13 @@ async function startHls(profile: Quality, requestedByUser = false, positionOverr
                     errorRetry: null,
                 },
             }
+            const targets = bufferTargets(preferences.bufferMegabytes, sourceBitrate(profile, 0))
             const player = new HlsPlayer({
                 autoStartLoad: false,
-                maxBufferLength: preferences.forwardBufferSeconds,
-                backBufferLength: preferences.backBufferSeconds,
-                maxBufferSize: 120 * 1000 * 1000,
+                maxBufferLength: targets.forwardSeconds,
+                maxMaxBufferLength: targets.forwardSeconds,
+                backBufferLength: targets.backSeconds,
+                maxBufferSize: targets.forwardBytes,
                 manifestLoadPolicy: conversionLoadPolicy,
                 fragLoadPolicy: conversionLoadPolicy,
             })
@@ -438,6 +564,7 @@ async function startHls(profile: Quality, requestedByUser = false, positionOverr
             })
             if (duration === undefined) return
             trackDuration = duration
+            applyBufferConfig(player, sourceBitrate(profile, duration))
         } else {
             systemBufferNotice.value = true
             const response = await fetch(url, {method: 'HEAD', signal: probe.signal})
@@ -472,6 +599,7 @@ async function startHls(profile: Quality, requestedByUser = false, positionOverr
             media.src = url
         }
         setSpeed()
+        updateBuffered()
         if (playRequested) void play()
     } catch {
         if (generation !== playbackGeneration) return
@@ -488,19 +616,175 @@ async function startHls(profile: Quality, requestedByUser = false, positionOverr
     }
 }
 
-function switchQuality(next: Quality) {
+class SwitchFailure extends Error {
+    status: number | undefined
+
+    constructor(message: string, status?: number) {
+        super(message)
+        this.status = status
+    }
+}
+
+async function switchQuality(next: Quality) {
     const current = activeProfile.value ?? preferences.quality
     if (next === current) {
         preferences.quality = next
         return
     }
-    preferences.quality = next
     const media = video.value
-    const position = media?.currentTime ?? 0
-    const wasPlaying = !!media && !media.paused
+    if (!media || switchingQuality.value || !src.value) return
+    const previousHls = hls
+    const position = media.currentTime
+    const wasPlaying = !media.paused
+    const switchSession = newSessionId()
+    const targetSlot: VideoSlot = activeSlot.value === 'primary' ? 'secondary' : 'primary'
+    const target = videoForSlot(targetSlot)
+    if (!target) return
+
+    preferences.quality = next
+    switchingQuality.value = true
+    qualityNotice.value = undefined
     playRequested = wasPlaying
-    unloadPlayback()
-    void nextTick().then(() => startHls(next, wasPlaying, position))
+    switchAbort?.abort()
+    const probe = new AbortController()
+    switchAbort = probe
+    switchHls?.destroy()
+    switchHls = undefined
+    unloadMedia(target)
+
+    try {
+        const {default: HlsPlayer} = await import('hls.js/light')
+        if (probe.signal.aborted) return
+        if (!HlsPlayer.isSupported() && !target.canPlayType('application/vnd.apple.mpegurl')) {
+            throw new SwitchFailure('This browser cannot switch HLS quality')
+        }
+
+        const url = transcodeUrl(src.value, next, switchSession)
+        let player: Hls | undefined
+        if (HlsPlayer.isSupported()) {
+            const conversionLoadPolicy = {
+                default: {
+                    maxTimeToFirstByteMs: 50_000,
+                    maxLoadTimeMs: 50_000,
+                    timeoutRetry: null,
+                    errorRetry: null,
+                },
+            }
+            const targets = bufferTargets(preferences.bufferMegabytes, sourceBitrate(next, 0))
+            player = new HlsPlayer({
+                autoStartLoad: false,
+                maxBufferLength: targets.forwardSeconds,
+                maxMaxBufferLength: targets.forwardSeconds,
+                backBufferLength: targets.backSeconds,
+                maxBufferSize: targets.forwardBytes,
+                manifestLoadPolicy: conversionLoadPolicy,
+                fragLoadPolicy: conversionLoadPolicy,
+            })
+            switchHls = player
+            const trackDuration = await new Promise<number>((resolve, reject) => {
+                let settled = false
+                const finish = (value?: number, error?: Error) => {
+                    if (settled) return
+                    settled = true
+                    window.clearTimeout(timeout)
+                    probe.signal.removeEventListener('abort', aborted)
+                    if (error) reject(error)
+                    else resolve(value ?? 0)
+                }
+                const aborted = () => finish(undefined, new DOMException('Aborted', 'AbortError'))
+                const timeout = window.setTimeout(() => finish(undefined, new SwitchFailure('Quality switch timed out')), 15_000)
+                probe.signal.addEventListener('abort', aborted, {once: true})
+                player!.once(HlsPlayer.Events.MANIFEST_PARSED, (_, {levels, firstLevel}) => {
+                    finish(levels[firstLevel]?.details?.totalduration ?? 0)
+                })
+                player!.on(HlsPlayer.Events.ERROR, (_, details) => {
+                    if (!details.fatal) return
+                    finish(undefined, new SwitchFailure('Could not prepare the requested quality', details.response?.code))
+                })
+                player!.loadSource(url)
+            })
+            applyBufferConfig(player, sourceBitrate(next, trackDuration))
+            player.attachMedia(target)
+            player.startLoad(position < trackDuration ? position : 0)
+        } else {
+            target.src = url
+            target.load()
+            await new Promise<void>((resolve, reject) => {
+                const finish = (error?: Error) => {
+                    window.clearTimeout(timeout)
+                    target.removeEventListener('loadedmetadata', loaded)
+                    probe.signal.removeEventListener('abort', aborted)
+                    if (error) reject(error)
+                    else resolve()
+                }
+                const loaded = () => finish()
+                const aborted = () => finish(new DOMException('Aborted', 'AbortError'))
+                const timeout = window.setTimeout(() => finish(new SwitchFailure('Quality switch timed out')), 8_000)
+                target.addEventListener('loadedmetadata', loaded, {once: true})
+                probe.signal.addEventListener('abort', aborted, {once: true})
+            })
+            target.currentTime = Math.min(position, target.duration || position)
+        }
+
+        target.volume = volume.value
+        target.muted = true
+        target.playbackRate = speed.value
+        await waitForPlayable(target, target.currentTime || position, probe.signal)
+        if (probe.signal.aborted) return
+        target.currentTime = Math.min(position, target.duration || position)
+        await waitForPlayable(target, target.currentTime, probe.signal)
+        if (probe.signal.aborted) return
+        await waitForSwitchBuffer(target, media, probe.signal)
+        if (probe.signal.aborted) return
+
+        target.currentTime = media.currentTime
+        await waitForPlayable(target, target.currentTime, probe.signal)
+        if (probe.signal.aborted) return
+        target.volume = volume.value
+        target.playbackRate = speed.value
+        if (wasPlaying) {
+            if (target.paused) await target.play()
+            target.muted = muted.value || volume.value === 0
+        } else {
+            target.pause()
+            target.muted = muted.value || volume.value === 0
+        }
+
+        activeSlot.value = targetSlot
+        hls = player
+        switchHls = undefined
+        playbackSession.value = switchSession
+        compatible.value = true
+        directFailed.value = false
+        activeProfile.value = next
+        waitingForPicture.value = !target.videoWidth
+        failure.value = undefined
+        systemBufferNotice.value = false
+        playRequested = wasPlaying
+        if (wasPlaying) media.pause()
+        previousHls?.destroy()
+        unloadMedia(media)
+        duration.value = Number.isFinite(target.duration) ? target.duration : duration.value
+        time.value = target.currentTime
+        updateBuffered()
+    } catch (cause) {
+        switchHls?.destroy()
+        switchHls = undefined
+        unloadMedia(target)
+        if (probe.signal.aborted) return
+        const status = cause instanceof SwitchFailure ? cause.status : undefined
+        if (next === 'original' && [422, 502, 503].includes(status ?? 0)) {
+            switchingQuality.value = false
+            switchAbort = undefined
+            await switchQuality('720p')
+            qualityNotice.value = 'originalUnavailable'
+            return
+        }
+        qualityNotice.value = 'qualitySwitchFailed'
+    } finally {
+        if (switchAbort === probe) switchAbort = undefined
+        switchingQuality.value = false
+    }
 }
 
 function onQualityChange(event: Event) {
@@ -513,7 +797,16 @@ function transcodeError(status?: number): CompatibilityFailure {
     return 'transcodeFailed'
 }
 
-function onMediaError() {
+function onMediaPlay(event: Event) {
+    if (isActiveEvent(event)) playing.value = true
+}
+
+function onMediaPause(event: Event) {
+    if (isActiveEvent(event)) playing.value = false
+}
+
+function onMediaError(event?: Event) {
+    if (event && !isActiveEvent(event)) return
     if (!src.value) return
     if (compatible.value) {
         if (video.value?.error) compatibilityFailed('transcodeFailed')
@@ -522,7 +815,8 @@ function onMediaError() {
     directFailed.value = true
 }
 
-function onMediaData() {
+function onMediaData(event?: Event) {
+    if (event && !isActiveEvent(event)) return
     const media = video.value
     if (!media) return
     if (compatible.value) {
@@ -538,17 +832,20 @@ function togglePlayback() {
     else pause()
 }
 
-function mediaTime() {
+function mediaTime(event?: Event) {
+    if (event && !isActiveEvent(event)) return
     if (!video.value) return
     time.value = video.value.currentTime
     duration.value = Number.isFinite(video.value.duration) ? video.value.duration : 0
+    updateBuffered()
 }
 
 function setTime(event: Event) {
     if (video.value && duration.value > 0) video.value.currentTime = (event.target as HTMLInputElement).valueAsNumber
 }
 
-function mediaVolume() {
+function mediaVolume(event?: Event) {
+    if (event && !isActiveEvent(event)) return
     if (!video.value) return
     volume.value = video.value.volume
     muted.value = video.value.muted
@@ -573,7 +870,8 @@ function select(at: number) {
     if (item && at !== index.value) void router.replace(playerRoute(directory.value, item.name))
 }
 
-function ended() {
+function ended(event?: Event) {
+    if (event && !isActiveEvent(event)) return
     if (!src.value || !video.value?.ended) return
     playing.value = false
     if (editStart.value === undefined) select(index.value + 1)
@@ -722,10 +1020,14 @@ watch(playing, (isPlaying) => {
     else clearControlsTimer()
 })
 
-onMounted(() => document.addEventListener('fullscreenchange', updateFullscreen))
+onMounted(() => {
+    document.addEventListener('fullscreenchange', updateFullscreen)
+    bufferTimer = window.setInterval(updateBuffered, 500)
+})
 onBeforeUnmount(() => {
     unloadPlayback()
     window.clearTimeout(timer)
+    window.clearInterval(bufferTimer)
     clearControlsTimer()
     document.removeEventListener('fullscreenchange', updateFullscreen)
 })
@@ -764,10 +1066,14 @@ const supportsPip = document.pictureInPictureEnabled
                         tabindex="0" :aria-label="t('player')" role="region" @keydown="playerKeys"
                         @pointermove="onPlayerPointerMove">
                         <div class="picture" :class="{'audio-picture': audioLayout}">
-                            <video ref="video" playsinline preload="auto"
+                            <video ref="primaryVideo" :class="{inactive: activeSlot !== 'primary'}" playsinline preload="auto"
                                 @click="onPictureClick" @durationchange="mediaTime" @timeupdate="mediaTime"
-                                @volumechange="mediaVolume" @play="playing = true" @pause="playing = false"
-                                @ended="ended" @loadeddata="onMediaData" @error="onMediaError"></video>
+                                @volumechange="mediaVolume" @play="onMediaPlay" @pause="onMediaPause"
+                                @progress="updateBuffered" @ended="ended" @loadeddata="onMediaData" @error="onMediaError"></video>
+                            <video ref="secondaryVideo" :class="{inactive: activeSlot !== 'secondary'}" playsinline preload="auto"
+                                @click="onPictureClick" @durationchange="mediaTime" @timeupdate="mediaTime"
+                                @volumechange="mediaVolume" @play="onMediaPlay" @pause="onMediaPause"
+                                @progress="updateBuffered" @ended="ended" @loadeddata="onMediaData" @error="onMediaError"></video>
                             <div v-if="audioLayout" class="audio-art" aria-hidden="true"><Music2 :size="58" :stroke-width="1.3" /></div>
                             <div v-if="mediaLoading" class="play-error" role="status">
                                 <LoaderCircle :size="28" /><strong>{{ t('preparingMedia') }}</strong>
@@ -794,6 +1100,10 @@ const supportsPip = document.pictureInPictureEnabled
                             @pointerenter="holdControls" @pointerleave="releaseControls" @focusin="holdControls" @focusout="releaseControls">
                         <div class="controls">
                             <div class="timeline" :class="{'has-chapters': chapterSegments.length}">
+                                <div v-if="bufferedSegments.length" class="buffer-track" aria-hidden="true">
+                                    <span v-for="(segment, bufferIndex) in bufferedSegments" :key="bufferIndex"
+                                        :style="{left: segment.left, width: segment.width}"></span>
+                                </div>
                                 <div v-if="chapterSegments.length" class="chapter-track" aria-hidden="true">
                                     <span v-for="segment in chapterSegments" :key="segment.start"
                                         :style="{width: segment.width, '--fill': segment.fill}"></span>
@@ -940,7 +1250,7 @@ const supportsPip = document.pictureInPictureEnabled
                             <Film :size="17" /><span class="sr-only">{{ t('quality') }}</span>
                             <select class="select" :value="activeProfile ?? preferences.quality"
                                 :aria-label="t('quality')" :title="t('quality')"
-                                :disabled="!!compatibilityProbe" @change="onQualityChange">
+                                :disabled="!!compatibilityProbe || switchingQuality" @change="onQualityChange">
                                 <option v-for="quality in qualityOptions" :key="quality" :value="quality">
                                     {{ qualityLabel(quality) }}
                                 </option>
@@ -965,6 +1275,7 @@ const supportsPip = document.pictureInPictureEnabled
                     </div>
                     <p v-if="failure && !playbackBlocked" class="play-notice" role="status">{{ t(failure) }}</p>
                     <p v-if="qualityNotice" class="play-notice" role="status">{{ t(qualityNotice) }}</p>
+                    <p v-if="switchingQuality" class="play-notice" role="status">{{ t('switchingQuality') }}</p>
                     <p v-if="systemBufferNotice" class="play-notice" role="status">{{ t('systemBufferNotice') }}</p>
                 </div>
 
@@ -1022,6 +1333,7 @@ const supportsPip = document.pictureInPictureEnabled
 .stage { display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 13px; background: #090a0e; }
 .picture { display: grid; place-items: center; position: relative; isolation: isolate; aspect-ratio: 16 / 9; background: #06070a; }
 .picture video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; cursor: pointer; }
+.picture video.inactive { opacity: 0; pointer-events: none; }
 .audio-picture { background: radial-gradient(ellipse at 67% 20%, #3b334d, transparent 70%), linear-gradient(130deg, #232c3d, #1d1825); }
 .audio-picture video { opacity: 0; }
 .audio-art { display: grid; place-items: center; width: 104px; height: 104px; border: 1px solid #dbbfe752; border-radius: 24px; color: #dfc3e8; background: #8e739d23; pointer-events: none; }
@@ -1037,6 +1349,8 @@ const supportsPip = document.pictureInPictureEnabled
 .seek, .volume { display: block; margin: 0; accent-color: var(--accent); cursor: pointer; }
 .seek { width: 100%; height: 17px; }
 .timeline { position: relative; display: grid; align-items: center; min-height: 22px; }
+.buffer-track { position: absolute; inset-inline: 6px; top: 3px; z-index: 2; height: 3px; pointer-events: none; }
+.buffer-track span { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 2px; background: #e7ebf566; box-shadow: 0 0 7px #e7ebf526; }
 .chapter-track { position: absolute; inset-inline: 6px; display: flex; height: 5px; pointer-events: none; }
 .chapter-track span { min-width: 0; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--fill), #494e5c var(--fill)); }
 .chapter-track span:not(:last-child) { box-shadow: inset -2px 0 #191c23; }

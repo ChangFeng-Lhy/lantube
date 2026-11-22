@@ -296,10 +296,6 @@ impl PlaybackTimeline {
                 let mut chunk = String::with_capacity((end - start) as usize * (token.len() + 64));
                 for index in start..end {
                     let length = self.segment_at(index, count).length;
-                    // 每段独立复用，MPEG-TS 连续性计数器会重新开始。
-                    if index > 0 {
-                        chunk.push_str("#EXT-X-DISCONTINUITY\n");
-                    }
                     writeln!(chunk, "#EXTINF:{length:.6},\n?segment={index}&plan={token}")
                         .expect("writing to a String cannot fail");
                 }
@@ -1109,12 +1105,10 @@ mod tests {
         let result = playlist(timeline(0.0..9.25, 9.25)).unwrap();
         assert!(result.contains("#EXT-X-TARGETDURATION:4\n"));
         assert!(result.contains("#EXTINF:4.000000,\n?segment=0&plan=token\n"));
-        assert!(
-            result.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.250000,\n?segment=2&plan=token\n")
-        );
+        assert!(result.contains("#EXTINF:1.250000,\n?segment=2&plan=token\n"));
         assert!(result.ends_with("#EXT-X-ENDLIST\n"));
         assert_eq!(result.matches("#EXTINF:").count(), 3);
-        assert_eq!(result.matches("#EXT-X-DISCONTINUITY\n").count(), 2);
+        assert_eq!(result.matches("#EXT-X-DISCONTINUITY\n").count(), 0);
     }
 
     #[test]
@@ -1130,7 +1124,7 @@ mod tests {
             PLAYLIST_CHUNK_SEGMENTS as usize
         );
         let second = chunks.next().unwrap();
-        assert!(second.starts_with("#EXT-X-DISCONTINUITY\n#EXTINF:4.000000,\n?segment=128&"));
+        assert!(second.starts_with("#EXTINF:4.000000,\n?segment=128&"));
     }
 
     #[test]

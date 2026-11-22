@@ -23,7 +23,7 @@ This is a LAN video server, which can be deployed on any device (with operating 
 * Navigate shared folders with a directory tree, breadcrumbs and search within the current folder.
 * Browse video frames in the library and the play queue.
 * Play H.264 videos without re-encoding, or transcode to compatible 1080p, 720p, or 480p.
-* Configure forward and back buffering in the player. Buffered media stays on the playback device, not in server memory.
+* Configure a player cache budget in MB. The grey-white seek-bar range shows media buffered on the playback device, and quality changes preload before switching.
 * Optionally cache compatible segments in a bounded LRU directory on disk.
 * Upload files, create folders and switch between English and Simplified Chinese.
 * Play the queue automatically or manually, with a sleep timer.
@@ -50,7 +50,7 @@ To enable access from other devices on a trusted LAN or choose other media direc
 
 Compatible playback and server-generated thumbnails require `ffmpeg` and `ffprobe` on the server's `PATH`, from FFmpeg 5.1 or later. Put the tools in an absolute `PATH` directory outside your media folders before starting LanTube. Hardware H.264 encoders (`h264_v4l2m2m` or `h264_omx`) are detected and test-encoded at startup; LanTube falls back to `libx264` when neither works. The server reads the source files as-is.
 
-Use the quality menu below the player to choose the original stream or a compatible 1080p, 720p, or 480p stream. Original playback remuxes H.264 video without re-encoding and falls back to compatible 720p when a file cannot be remuxed. Open **Settings** to choose the default quality and the forward/back buffer lengths. Buffering is handled by hls.js on the playback device; the server only keeps the segments currently being generated or read. Changes to buffer settings apply the next time playback starts.
+Use the quality menu below the player to choose the original stream or a compatible 1080p, 720p, or 480p stream. Original playback remuxes H.264 video without re-encoding and falls back to compatible 720p when a file cannot be remuxed. Open **Settings** to choose the default quality and a player cache budget in MB. Buffering is handled by hls.js on the playback device; the server only keeps the segments currently being generated or read. The grey-white seek-bar range shows what is already buffered. Changes apply when playback next starts or the quality changes.
 
 Use **Show other files** in a folder to open media with an unrecognized or missing extension. Those entries are opened individually and stay out of automatic playback.
 

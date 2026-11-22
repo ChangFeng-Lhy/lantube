@@ -1,17 +1,26 @@
 <script setup lang="ts">
-import {Clock3, Eye, Film, Globe2, Grid2X2, List} from '@lucide/vue'
+import {computed} from 'vue'
+import {Eye, Film, Globe2, Grid2X2, HardDrive, List} from '@lucide/vue'
 import {useI18n} from 'vue-i18n'
-import {preferences, qualityOptions} from '../preferences'
+import {
+    backBufferSeconds, bufferMegabytesMax, bufferMegabytesMin, bufferMegabytesStep, bufferTargets,
+    clampBufferMegabytes, defaultBufferMegabytes, preferences, profileBitrate, qualityOptions,
+} from '../preferences'
 const {t} = useI18n()
 
-function normalizeBuffers() {
-    if (!Number.isFinite(preferences.forwardBufferSeconds)) preferences.forwardBufferSeconds = 12
-    if (!Number.isFinite(preferences.backBufferSeconds)) preferences.backBufferSeconds = 4
-    preferences.forwardBufferSeconds = Math.min(60, Math.max(4, Math.round(preferences.forwardBufferSeconds / 4) * 4))
-    preferences.backBufferSeconds = Math.min(30, Math.max(0, Math.round(preferences.backBufferSeconds / 4) * 4))
+function normalizeBuffer() {
+    if (!Number.isFinite(preferences.bufferMegabytes)) preferences.bufferMegabytes = defaultBufferMegabytes
+    preferences.bufferMegabytes = clampBufferMegabytes(preferences.bufferMegabytes)
 }
 
 const qualityLabel = (quality: typeof qualityOptions[number]) => t(`quality${quality === 'original' ? 'Original' : quality === '1080p' ? '1080' : quality === '720p' ? '720' : '480'}`)
+const bufferEstimate = computed(() => {
+    const bitrate = profileBitrate(preferences.quality)
+    if (!bitrate) return t('bufferEstimateOriginal')
+    const seconds = bufferTargets(preferences.bufferMegabytes, bitrate).forwardSeconds + backBufferSeconds
+    const minutes = new Intl.NumberFormat(undefined, {maximumFractionDigits: 1}).format(seconds / 60)
+    return t('bufferEstimate', {minutes, quality: qualityLabel(preferences.quality)})
+})
 </script>
 
 <template>
@@ -41,19 +50,11 @@ const qualityLabel = (quality: typeof qualityOptions[number]) => t(`quality${qua
                 </select>
             </label>
             <label class="settings-row">
-                <span><Clock3 :size="20" />{{ t('forwardBuffer') }}</span>
+                <span><HardDrive :size="20" />{{ t('bufferBudget') }}</span>
                 <span class="settings-value">
-                    <input v-model.number="preferences.forwardBufferSeconds" class="number-input" type="number"
-                        min="4" max="60" step="4" @change="normalizeBuffers">
-                    <small>{{ t('bufferSegmentsHint', {count: Math.round(preferences.forwardBufferSeconds / 4)}) }}</small>
-                </span>
-            </label>
-            <label class="settings-row">
-                <span><Clock3 :size="20" />{{ t('backBuffer') }}</span>
-                <span class="settings-value">
-                    <input v-model.number="preferences.backBufferSeconds" class="number-input" type="number"
-                        min="0" max="30" step="4" @change="normalizeBuffers">
-                    <small>{{ t('bufferSegmentsHint', {count: Math.round(preferences.backBufferSeconds / 4)}) }}</small>
+                    <input v-model.number="preferences.bufferMegabytes" class="number-input" type="number"
+                        :min="bufferMegabytesMin" :max="bufferMegabytesMax" :step="bufferMegabytesStep" @change="normalizeBuffer">
+                    <small>{{ t('megabytes') }}</small>
                 </span>
             </label>
             <label class="settings-row">
@@ -61,7 +62,7 @@ const qualityLabel = (quality: typeof qualityOptions[number]) => t(`quality${qua
                 <input v-model="preferences.showHidden" type="checkbox">
             </label>
         </div>
-        <p class="settings-help">{{ t('bufferSettingsHelp') }}</p>
+        <p class="settings-help">{{ t('bufferSettingsHelp') }} {{ bufferEstimate }}</p>
     </section>
 </template>
 
@@ -76,6 +77,6 @@ h1 { margin: 5px 0 23px; font-size: clamp(28px, 4vw, 38px); letter-spacing: -.04
 .settings-row input[type="checkbox"] { width: 19px; height: 19px; accent-color: var(--accent); cursor: pointer; }
 .settings-value { justify-content: flex-end; }
 .settings-value small { color: var(--muted); font-size: 12px; }
-.number-input { width: 74px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+.number-input { width: 92px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
 .settings-help { margin: 14px 2px 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
 </style>
