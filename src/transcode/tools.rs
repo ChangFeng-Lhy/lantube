@@ -9,11 +9,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     sync::OnceCell,
+    time::timeout,
 };
 
 const INPUT_FORMATS: &str =
@@ -85,15 +87,17 @@ impl MediaTools {
     }
 
     async fn detect_h264_encoder(&self) -> H264Encoder {
+        if let Some(encoder) = forced_h264_encoder() {
+            return encoder;
+        }
         let Ok(ffmpeg) = self.encoder() else {
             return H264Encoder::X264;
         };
-        let Ok(output) = self
-            .command(ffmpeg)
-            .args(["-hide_banner", "-encoders"])
-            .output()
-            .await
-        else {
+        let mut command = self.command(ffmpeg);
+        command
+            .kill_on_drop(true)
+            .args(["-hide_banner", "-encoders"]);
+        let Ok(Ok(output)) = timeout(Duration::from_secs(5), command.output()).await else {
             return H264Encoder::X264;
         };
         let encoders = String::from_utf8_lossy(&output.stdout);
@@ -122,11 +126,12 @@ impl MediaTools {
                 "null",
                 "-",
             ]);
-            if command
-                .output()
-                .await
-                .is_ok_and(|output| output.status.success())
-            {
+            command.kill_on_drop(true);
+            let supported = match timeout(Duration::from_secs(5), command.output()).await {
+                Ok(Ok(output)) => output.status.success(),
+                _ => false,
+            };
+            if supported {
                 return encoder;
             }
         }
@@ -141,6 +146,20 @@ impl MediaTools {
                 .expect("tool path must have a parent directory"),
         );
         command
+    }
+}
+
+fn forced_h264_encoder() -> Option<H264Encoder> {
+    match env::var("LANTUBE_H264_ENCODER")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "libx264" | "x264" => Some(H264Encoder::X264),
+        "h264_v4l2m2m" | "v4l2" => Some(H264Encoder::V4l2),
+        "h264_omx" | "omx" => Some(H264Encoder::Omx),
+        _ => None,
     }
 }
 
